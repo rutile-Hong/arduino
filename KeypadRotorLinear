@@ -1,78 +1,79 @@
 #include <Keypad.h>
-#include <Servo.h>
+#include <Servo.h> // HS-755HB
 #include <EEPROM.h>
-#include <RotaryEncoder.h>
+#include <RotaryEncoder.h> // KY-040
 
-/* =====================================================
-   Rotary Encoder (KY-040)
-   ===================================================== */
+/* ================= Rotary Encoder (KY-040) ================= */
 #define ENC_CLK 12
 #define ENC_DT  11
 #define ENC_SW  13
-
 RotaryEncoder encoder(ENC_CLK, ENC_DT, RotaryEncoder::LatchMode::TWO03);
 
-int Counter = 0;                 // live encoder count
-const int EEPROM_ADDR = 0;       // address to store Counter
+int32_t Counter = 0;
 
-// EEPROM write protection
-const unsigned long EEPROM_SAVE_DELAY_MS = 1000;  // save 1s after last change
-unsigned long lastEncChangeMs = 0;
-bool pendingSave = false;
+/* ================= EEPROM LOG (store ALL records) =================
+   EEPROM layout:
+   [0..1]   uint16_t magic
+   [2..3]   uint16_t writeIndex   (0..MAX_RECORDS-1)
+   [4.. ]   records array
+*/
+const uint16_t EEPROM_MAGIC = 0xBEEF;
+const int EEPROM_HDR_ADDR = 0;
 
-/* =====================================================
-   Keypad 4x4
-   ===================================================== */
-const byte ROWS = 4;
-const byte COLS = 4;
+struct LogHeader {
+  uint16_t magic;
+  uint16_t writeIndex;
+};
 
+struct Record {
+  int32_t  count;
+  uint32_t timeMs;
+  uint16_t crc;    // simple integrity (optional but useful)
+};
+
+uint16_t simpleCrc(const Record &r) {
+  // very small checksum (not a real CRC, but catches many corrupt reads)
+  uint16_t x = 0x1234;
+  x ^= (uint16_t)(r.count & 0xFFFF);
+  x ^= (uint16_t)((r.count >> 16) & 0xFFFF);
+  x ^= (uint16_t)(r.timeMs & 0xFFFF);
+  x ^= (uint16_t)((r.timeMs >> 16) & 0xFFFF);
+  return x;
+}
+
+// Compute how many records fit (UNO EEPROM is 1024 bytes)
+const int EEPROM_SIZE = EEPROM.length();
+const int RECORDS_BASE_ADDR = EEPROM_HDR_ADDR + (int)sizeof(LogHeader);
+const int MAX_RECORDS = (EEPROM_SIZE - RECORDS_BASE_ADDR) / (int)sizeof(Record);
+
+LogHeader hdr;
+
+/* ================= Keypad 4x4 ================= */
+const byte ROWS = 4, COLS = 4;
 char keys[ROWS][COLS] = {
   {'1','2','3','A'},
   {'4','5','6','B'},
   {'7','8','9','C'},
   {'*','0','#','D'}
 };
-
 byte rowPins[ROWS] = {2, 3, 4, 5};
 byte colPins[COLS] = {6, 7, 8, 10};
-
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-/* =====================================================
-   Servo (HS-785HB winch)
-   ===================================================== */
+/* ================= Servo (HS-785HB winch) ================= */
 Servo winch;
 const int servoPin = 9;
+const int POS_MIN  = 0;
+const int POS_MAX  = 180;
+const int POS_STOP = 90;
 
-// For a continuous-rotation/winch servo, 90 is usually stop,
-// lower/higher is one direction/other direction (may need tuning).
-const int POS_MIN  = 0;    // full speed one direction
-const int POS_MAX  = 180;  // full speed other direction
-const int POS_STOP = 90;   // stop (adjust if your servo drifts)
-
-/* =====================================================
-   Modes (keypad)
-   1 = run POS_MAX
-   2 = run POS_MIN
-   4 = toggle between POS_MAX and POS_MIN every 2 seconds
-   5 = stop
-   ===================================================== */
+/* ================= Modes (keypad) ================= */
 char mode = '5';
 bool toggleState = false;
 unsigned long lastToggleUs = 0;
 const unsigned long TOGGLE_INTERVAL_US = 2000000UL;
 
-/* =====================================================
-   Encoder button debounce (non-blocking)
-   ===================================================== */
-bool lastBtnReading = HIGH;
-bool btnStableState = HIGH;
-unsigned long lastBtnChangeMs = 0;
-const unsigned long BTN_DEBOUNCE_MS = 30;
-
-/* =====================================================
-   Helpers
-   ===================================================== */
+/* ================= Helpers ================= */
 void setServoPos(int pos) {
   static int lastPos = -1;
   if (pos != lastPos) {
@@ -81,77 +82,118 @@ void setServoPos(int pos) {
   }
 }
 
+int recordAddr(uint16_t index) {
+  return RECORDS_BASE_ADDR + index * (int)sizeof(Record);
+}
+
+void loadHeader() {
+  EEPROM.get(EEPROM_HDR_ADDR, hdr);
+  if (hdr.magic != EEPROM_MAGIC || hdr.writeIndex >= MAX_RECORDS) {
+    hdr.magic = EEPROM_MAGIC;
+    hdr.writeIndex = 0;
+    EEPROM.put(EEPROM_HDR_ADDR, hdr);
+  }
+}
+
+void clearLog() {
+  hdr.magic = EEPROM_MAGIC;
+  hdr.writeIndex = 0;
+  EEPROM.put(EEPROM_HDR_ADDR, hdr);
+  Serial.println("Log cleared (index reset to 0)");
+}
+
+void appendRecord(int32_t countVal) {
+  Record r;
+  r.count = countVal;
+  r.timeMs = millis();
+  r.crc = simpleCrc(r);
+
+  int addr = recordAddr(hdr.writeIndex);
+  EEPROM.put(addr, r);
+
+  // advance (circular)
+  hdr.writeIndex++;
+  if (hdr.writeIndex >= MAX_RECORDS) hdr.writeIndex = 0;
+
+  EEPROM.put(EEPROM_HDR_ADDR, hdr);
+
+  Serial.print("Logged @");
+  Serial.print((int)(hdr.writeIndex == 0 ? MAX_RECORDS - 1 : hdr.writeIndex - 1));
+  Serial.print(": count=");
+  Serial.print(r.count);
+  Serial.print(" timeMs=");
+  Serial.println(r.timeMs);
+}
+
+bool readRecord(uint16_t index, Record &out) {
+  if (index >= MAX_RECORDS) return false;
+  EEPROM.get(recordAddr(index), out);
+  return (out.crc == simpleCrc(out));
+}
+
+void dumpLog() {
+  Serial.print("MAX_RECORDS=");
+  Serial.print(MAX_RECORDS);
+  Serial.print(" writeIndex=");
+  Serial.println(hdr.writeIndex);
+
+  for (uint16_t i = 0; i < MAX_RECORDS; i++) {
+    Record r;
+    if (readRecord(i, r)) {
+      Serial.print(i);
+      Serial.print(",count=");
+      Serial.print(r.count);
+      Serial.print(",timeMs=");
+      Serial.println(r.timeMs);
+    }
+  }
+}
+
+/* ================= Serial commands =================
+   r = dump all valid records
+   c = clear log
+   i = info
+*/
 void handleSerial() {
   while (Serial.available()) {
     char c = Serial.read();
 
     if (c == 'r' || c == 'R') {
-      int v;
-      EEPROM.get(EEPROM_ADDR, v);
-      Serial.print("EEPROM Counter=");
-      Serial.println(v);
-    } else if (c == 'p' || c == 'P') {
-      Serial.print("RAM Counter=");
-      Serial.println(Counter);
+      dumpLog();
     } else if (c == 'c' || c == 'C') {
-      int v = 0;
-      EEPROM.put(EEPROM_ADDR, v);
+      clearLog();
       Counter = 0;
       encoder.setPosition(0);
-      Serial.println("EEPROM cleared, counter reset");
+    } else if (c == 'i' || c == 'I') {
+      Serial.print("EEPROM_SIZE=");
+      Serial.print(EEPROM_SIZE);
+      Serial.print(" RECORD_SIZE=");
+      Serial.print(sizeof(Record));
+      Serial.print(" MAX_RECORDS=");
+      Serial.print(MAX_RECORDS);
+      Serial.print(" writeIndex=");
+      Serial.println(hdr.writeIndex);
     }
   }
 }
 
+/* ================= Encoder ================= */
 void handleEncoder() {
-  encoder.tick(); // must be called often
-
-  int newPos = encoder.getPosition();
+  encoder.tick();
+  int32_t newPos = encoder.getPosition();
   if (newPos != Counter) {
     Counter = newPos;
-    lastEncChangeMs = millis();
-    pendingSave = true;
-
-    Serial.print("Encoder count: ");
-    Serial.println(Counter);
-  }
-
-  // Save to EEPROM only after it stops changing for a while
-  if (pendingSave && (millis() - lastEncChangeMs >= EEPROM_SAVE_DELAY_MS)) {
-    EEPROM.put(EEPROM_ADDR, Counter);
-    pendingSave = false;
-    Serial.print("Saved to EEPROM: ");
-    Serial.println(Counter);
-  }
-
-  // Encoder button debounce (press event)
-  bool reading = digitalRead(ENC_SW);
-  if (reading != lastBtnReading) {
-    lastBtnReading = reading;
-    lastBtnChangeMs = millis();
-  }
-  if ((millis() - lastBtnChangeMs) > BTN_DEBOUNCE_MS) {
-    if (reading != btnStableState) {
-      btnStableState = reading;
-      if (btnStableState == LOW) {
-        Serial.println("Encoder button pressed");
-        // Optional action: print counter
-        Serial.print("Counter=");
-        Serial.println(Counter);
-      }
-    }
+    appendRecord(Counter); // store EVERY change as a new record
   }
 }
 
+/* ================= Keypad ================= */
 void handleKeypad() {
   char key = keypad.getKey();
   if (!key) return;
 
   if (key == '1' || key == '2' || key == '4' || key == '5') {
     mode = key;
-    Serial.print("Mode key pressed: ");
-    Serial.println(mode);
-
     if (mode == '5') {
       setServoPos(POS_STOP);
     } else if (mode == '4') {
@@ -161,63 +203,41 @@ void handleKeypad() {
     }
   }
 
-  // Optional extra keypad actions:
-  // '#' -> print EEPROM
-  // '*' -> clear EEPROM/counter
-  if (key == '#') {
-    int v;
-    EEPROM.get(EEPROM_ADDR, v);
-    Serial.print("EEPROM Counter=");
-    Serial.println(v);
-  } else if (key == '*') {
-    int v = 0;
-    EEPROM.put(EEPROM_ADDR, v);
-    Counter = 0;
-    encoder.setPosition(0);
-    pendingSave = false;
-    Serial.println("EEPROM cleared, counter reset");
-  }
+  if (key == '#') dumpLog();
+  if (key == '*') clearLog();
 }
 
+/* ================= Servo Control ================= */
 void handleServoControl() {
-  if (mode == '1') {
-    setServoPos(POS_MAX);
-  } else if (mode == '2') {
-    setServoPos(POS_MIN);
-  } else if (mode == '4') {
+  if (mode == '1') setServoPos(POS_MAX);
+  else if (mode == '2') setServoPos(POS_MIN);
+  else if (mode == '4') {
     unsigned long now = micros();
     if (now - lastToggleUs >= TOGGLE_INTERVAL_US) {
       lastToggleUs = now;
       toggleState = !toggleState;
       setServoPos(toggleState ? POS_MAX : POS_MIN);
     }
-  } else { // '5' or anything else
-    setServoPos(POS_STOP);
-  }
+  } else setServoPos(POS_STOP);
 }
 
-/* =====================================================
-   Setup / Loop
-   ===================================================== */
+/* ================= Setup / Loop ================= */
 void setup() {
   Serial.begin(115200);
-
   pinMode(ENC_SW, INPUT_PULLUP);
 
-  // Restore encoder count from EEPROM
-  EEPROM.get(EEPROM_ADDR, Counter);
-  // Basic sanity check (optional; remove if you allow any range)
-  if (Counter < -100000 || Counter > 100000) Counter = 0;
+  loadHeader();
 
-  encoder.setPosition(Counter);
-
-  Serial.print("Restored encoder count from EEPROM: ");
-  Serial.println(Counter);
+  Serial.print("EEPROM log ready. MAX_RECORDS=");
+  Serial.println(MAX_RECORDS);
+  Serial.println("Commands: r=dump log, i=info, c=clear");
 
   winch.attach(servoPin);
   setServoPos(POS_STOP);
 
-  Serial.println("Commands: r=read EEPROM, p=read RAM, c=clear EEPROM");
+  // start encoder at 0 (your log will contain absolute encoder position)
+  encoder.setPosition(0);
+  Counter = 0;
 }
 
 void loop() {
@@ -225,6 +245,4 @@ void loop() {
   handleEncoder();
   handleKeypad();
   handleServoControl();
-
-  // No delay: keeps encoder responsive
 }
