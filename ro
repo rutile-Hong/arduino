@@ -1,21 +1,36 @@
-#include <Keypad.h> // 1: rotate 2: opposite rotate, 4: keep change direction, 5: stop at the middle
-#include <Servo.h>   / HS-785HB
-#include <EEPROM.h> // log count of the rotorary encode with time stamps
-#include <RotaryEncoder.h> KY-040
+#include <Keypad.h>        // 1: rotate  2: opposite rotate  4: keep change direction  5: stop at middle
+#include <Servo.h>         // HS-785HB
+#include <EEPROM.h>        // log rotary encoder count with timestamps
+#include <RotaryEncoder.h> // KY-040
+
+/* ================= YOUR PORTS (as you gave) =================
+   SD uses UNO SPI pins 11/12/13, so encoder must NOT use 11/12/13.
+   Encoder wires:
+     CLK -> D2
+     DT  -> D3
+     SW  -> A0
+
+   Keypad wires (you gave):
+     rowPins = {5, 6, A1, A2}
+     colPins = {7, 8, A3, A4}
+
+   Servo:
+     signal -> D9
+*/
 
 /* ================= Rotary Encoder (KY-040) ================= */
-#define ENC_CLK 12
-#define ENC_DT  11
-#define ENC_SW  13
-RotaryEncoder encoder(ENC_CLK, ENC_DT, RotaryEncoder::LatchMode::TWO03);
+#define ENC_CLK 2
+#define ENC_DT  3
+#define ENC_SW  A0
 
+RotaryEncoder encoder(ENC_CLK, ENC_DT, RotaryEncoder::LatchMode::FOUR3);
 int32_t Counter = 0;
 
 /* ================= EEPROM LOG (store ALL records) =================
    EEPROM layout:
-   [0..1]   uint16_t magic
-   [2..3]   uint16_t writeIndex   (0..MAX_RECORDS-1)
-   [4.. ]   records array
+   [0..1] uint16_t magic
+   [2..3] uint16_t writeIndex (0..MAX_RECORDS-1)
+   [4.. ] records array
 */
 const uint16_t EEPROM_MAGIC = 0xBEEF;
 const int EEPROM_HDR_ADDR = 0;
@@ -28,11 +43,10 @@ struct LogHeader {
 struct Record {
   int32_t  count;
   uint32_t timeMs;
-  uint16_t crc;    // simple integrity (optional but useful)
+  uint16_t crc;
 };
 
 uint16_t simpleCrc(const Record &r) {
-  // very small checksum (not a real CRC, but catches many corrupt reads)
   uint16_t x = 0x1234;
   x ^= (uint16_t)(r.count & 0xFFFF);
   x ^= (uint16_t)((r.count >> 16) & 0xFFFF);
@@ -41,7 +55,6 @@ uint16_t simpleCrc(const Record &r) {
   return x;
 }
 
-// Compute how many records fit (UNO EEPROM is 1024 bytes)
 const int EEPROM_SIZE = EEPROM.length();
 const int RECORDS_BASE_ADDR = EEPROM_HDR_ADDR + (int)sizeof(LogHeader);
 const int MAX_RECORDS = (EEPROM_SIZE - RECORDS_BASE_ADDR) / (int)sizeof(Record);
@@ -56,8 +69,11 @@ char keys[ROWS][COLS] = {
   {'7','8','9','C'},
   {'*','0','#','D'}
 };
-byte rowPins[ROWS] = {2, 3, 4, 5};
-byte colPins[COLS] = {6, 7, 8, 10};
+
+// UPDATED to your wiring
+byte rowPins[ROWS] = { A1, A2, 5, 6};
+byte colPins[COLS] = {A3, A4, 7, 8};
+
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
 /* ================= Servo (HS-785HB winch) ================= */
@@ -71,7 +87,7 @@ const int POS_STOP = 90;
 char mode = '5';
 bool toggleState = false;
 unsigned long lastToggleUs = 0;
-const unsigned long TOGGLE_INTERVAL_US = 2000000UL;
+const unsigned long TOGGLE_INTERVAL_US = 2000000UL; // 2 seconds
 
 /* ================= Helpers ================= */
 void setServoPos(int pos) {
@@ -111,14 +127,13 @@ void appendRecord(int32_t countVal) {
   int addr = recordAddr(hdr.writeIndex);
   EEPROM.put(addr, r);
 
-  // advance (circular)
+  uint16_t writtenAt = hdr.writeIndex;
   hdr.writeIndex++;
   if (hdr.writeIndex >= MAX_RECORDS) hdr.writeIndex = 0;
-
   EEPROM.put(EEPROM_HDR_ADDR, hdr);
 
   Serial.print("Logged @");
-  Serial.print((int)(hdr.writeIndex == 0 ? MAX_RECORDS - 1 : hdr.writeIndex - 1));
+  Serial.print(writtenAt);
   Serial.print(": count=");
   Serial.print(r.count);
   Serial.print(" timeMs=");
@@ -157,7 +172,6 @@ void dumpLog() {
 void handleSerial() {
   while (Serial.available()) {
     char c = Serial.read();
-
     if (c == 'r' || c == 'R') {
       dumpLog();
     } else if (c == 'c' || c == 'C') {
@@ -192,8 +206,12 @@ void handleKeypad() {
   char key = keypad.getKey();
   if (!key) return;
 
+  Serial.print("key: ");
+  Serial.println(key);
+
   if (key == '1' || key == '2' || key == '4' || key == '5') {
     mode = key;
+
     if (mode == '5') {
       setServoPos(POS_STOP);
     } else if (mode == '4') {
@@ -224,10 +242,13 @@ void handleServoControl() {
 /* ================= Setup / Loop ================= */
 void setup() {
   Serial.begin(115200);
+
+  // Encoder stability
+  pinMode(ENC_CLK, INPUT_PULLUP);
+  pinMode(ENC_DT, INPUT_PULLUP);
   pinMode(ENC_SW, INPUT_PULLUP);
 
   loadHeader();
-
   Serial.print("EEPROM log ready. MAX_RECORDS=");
   Serial.println(MAX_RECORDS);
   Serial.println("Commands: r=dump log, i=info, c=clear");
@@ -235,7 +256,6 @@ void setup() {
   winch.attach(servoPin);
   setServoPos(POS_STOP);
 
-  // start encoder at 0 (your log will contain absolute encoder position)
   encoder.setPosition(0);
   Counter = 0;
 }
