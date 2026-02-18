@@ -1,0 +1,21 @@
+// =====================================
+// RA-R-250-9 TTL PWM Control
+// =====================================
+
+const int PWM_PIN = 9;   // Must be PWM-capable pin
+
+void setup() {
+  pinMode(PWM_PIN, OUTPUT);
+}
+
+void loop() {
+
+  analogWrite(PWM_PIN, 1500);   // 50% duty cycle
+  delay(50);
+
+  analogWrite(PWM_PIN, 1600);   // ~80% duty cycle
+  delay(500);
+
+  analogWrite(PWM_PIN, 1400);     // Stop
+  delay(500);
+}
