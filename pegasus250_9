@@ -1,0 +1,14 @@
+#include <Servo.h>  // pegasus 250-9 servo
+
+Servo actuator;
+
+void setup() {
+  actuator.attach(9);
+}
+
+void loop() {
+  actuator.writeMicroseconds(1000);  // min location: 1000, mid location : 1500, max location :2000
+  delay(1000);  //delay 1000 ms enough to move min to max, 500 short 90 degrees move(?)
+  actuator.writeMicroseconds(2000);
+  delay(1000);
+}
