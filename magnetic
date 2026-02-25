@@ -1,0 +1,186 @@
+#include <SPI.h>
+#include <SD.h>
+#include <Keypad.h>
+#include <Servo.h>
+#include <EEPROM.h>
+#include <Wire.h>
+
+/* ================= PEGASUS ACTUATOR(250-9) ================= */
+Servo actuator;
+const int servoPin = 9;
+
+const int POS_MIN  = 1000;   // retract
+const int POS_MAX  = 2000;   // extend
+const int POS_STOP = 1500;   // stop (if speed type)
+
+unsigned long actuatorDelay = 900;  // default delay
+unsigned long lastChange = 0;
+bool extendState = false;
+
+void setActuatorUs(int us) {
+  static int lastUs = -1;
+  if (us != lastUs) {
+    actuator.writeMicroseconds(us);
+    lastUs = us;
+  }
+}
+
+/* ================= SD ================= */
+const int SD_CS_PIN = 4;
+File logFile;
+
+void sdInitOrHalt() {
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH);
+
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD init failed!");
+    while (1) {}
+  }
+
+  logFile = SD.open("log.csv", FILE_WRITE);
+  if (!logFile) {
+    Serial.println("log.csv open failed!");
+    while (1) {}
+  }
+
+  if (logFile.size() == 0) {
+    logFile.println("count,timeMs");
+    logFile.flush();
+  }
+}
+
+void sdLogLine(int32_t count, uint32_t timeMs) {
+  logFile.print(count);
+  logFile.print(",");
+  logFile.println(timeMs);
+  logFile.flush();
+}
+
+/* ================= ENCODER (AS5600) ================= */
+#define AS5600_ADDR 0x36
+
+uint16_t rawAngle = 0;
+uint16_t lastAngle = 0;
+int32_t Counter = 0;
+
+uint16_t readAS5600() {
+  Wire.beginTransmission(AS5600_ADDR);
+  Wire.write(0x0E);   // RAW ANGLE register
+  Wire.endTransmission();
+  Wire.requestFrom(AS5600_ADDR, 2);
+
+  if (Wire.available() == 2) {
+    uint16_t high = Wire.read();
+    uint16_t low  = Wire.read();
+    return (high << 8) | low;   // 0–4095
+  }
+  return lastAngle;
+}
+
+/* ================= EEPROM ================= */
+struct Record {
+  int32_t  count;
+  uint32_t timeMs;
+};
+
+void appendRecord(int32_t countVal) {
+  uint32_t t = millis();
+  sdLogLine(countVal, t);
+
+  Serial.print("Logged: ");
+  Serial.print(countVal);
+  Serial.print(" @ ");
+  Serial.println(t);
+}
+
+/* ================= KEYPAD ================= */
+const byte ROWS = 4, COLS = 4;
+
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte rowPins[ROWS] = {A1, A2, 5, 6};
+byte colPins[COLS] = {A3, A0, 7, 8};   // A4 replaced with A0 (minimal correction)
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+void handleKeypad() {
+  char key = keypad.getKey();
+  if (!key) return;
+
+  Serial.print("Key: ");
+  Serial.println(key);
+
+  if (key == '1') actuatorDelay = 300;
+  if (key == '2') actuatorDelay = 500;
+  if (key == '4') actuatorDelay = 700;
+  if (key == '5') actuatorDelay = 900;
+
+  if (key == '*') Serial.println("Clear command received");
+  if (key == '#') Serial.println("Dump command received");
+}
+
+/* ================= ACTUATOR CONTROL ================= */
+void handleActuator() {
+  if (millis() - lastChange >= actuatorDelay) {
+    lastChange = millis();
+    extendState = !extendState;
+
+    if (extendState)
+      setActuatorUs(POS_MAX);
+    else
+      setActuatorUs(POS_MIN);
+  }
+}
+
+/* ================= ENCODER HANDLER ================= */
+void handleEncoder() {
+
+  rawAngle = readAS5600();
+
+  int16_t delta = rawAngle - lastAngle;
+
+  // rollover correction
+  if (delta > 2048)  delta -= 4096;
+  if (delta < -2048) delta += 4096;
+
+  if (abs(delta) > 2) {
+    Counter += delta;
+    appendRecord(Counter);
+    lastAngle = rawAngle;
+  }
+}
+
+/* ================= SETUP ================= */
+void setup() {
+
+  Serial.begin(115200);
+
+  Wire.begin();   // initialize I2C
+
+  sdInitOrHalt();
+
+  actuator.attach(servoPin);
+  setActuatorUs(POS_STOP);
+
+  rawAngle = readAS5600();
+  lastAngle = rawAngle;
+  Counter = 0;
+
+  Serial.println("System Ready");
+  Serial.println("Keypad 1/2/4/5 changes actuator delay");
+}
+
+/* ================= LOOP ================= */
+void loop() {
+
+  handleKeypad();
+  handleEncoder();
+  handleActuator();
+
+}
