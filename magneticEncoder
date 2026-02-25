@@ -1,0 +1,261 @@
+#include <SPI.h>
+#include <SD.h>
+#include <Keypad.h>
+#include <Servo.h>
+#include <Wire.h>
+
+/* ================= ACTUATOR ================= */
+Servo actuator;
+const int servoPin = 9;
+
+const int POS_MIN  = 1000;
+const int POS_MAX  = 2000;
+const int POS_STOP = 1500;
+
+unsigned long actuatorDelay = 900;
+unsigned long lastChange = 0;
+bool extendState = false;
+
+void setActuatorUs(int us) {
+  static int lastUs = -1;
+  if (us != lastUs) {
+    actuator.writeMicroseconds(us);
+    lastUs = us;
+  }
+}
+
+/* ================= SD ================= */
+const int SD_CS_PIN = 4;
+File logFile;
+
+void sdInitOrHalt() {
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH);
+
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD init failed! (halt)");
+    while (1) {}
+  }
+
+  logFile = SD.open("log.csv", FILE_WRITE);
+  if (!logFile) {
+    Serial.println("log.csv open failed! (halt)");
+    while (1) {}
+  }
+
+  if (logFile.size() == 0) {
+    logFile.println("count,timeMs,angle,i2cErr");
+    logFile.flush();
+  }
+
+  Serial.println("SD Ready");
+}
+
+void sdLogLine(int32_t count, uint32_t timeMs, uint16_t angle, uint32_t i2cErr) {
+  if (!logFile) return;
+  logFile.print(count);
+  logFile.print(",");
+  logFile.print(timeMs);
+  logFile.print(",");
+  logFile.print(angle);
+  logFile.print(",");
+  logFile.println(i2cErr);
+}
+
+/* ================= AS5600 ================= */
+#define AS5600_ADDR 0x36
+static const uint8_t AS5600_RAW_ANGLE_REG = 0x0C;
+
+uint16_t angleNow = 0;
+uint16_t anglePrev = 0;
+int32_t Counter = 0;
+
+uint32_t i2cErrors = 0;
+uint16_t consecutiveI2cErrors = 0;
+
+// Use core SDA/SCL if present; otherwise default UNO pins
+#ifndef SDA
+  #define SDA A4
+#endif
+#ifndef SCL
+  #define SCL A5
+#endif
+
+void i2cBusRecover() {
+  pinMode(SCL, OUTPUT);
+  pinMode(SDA, INPUT_PULLUP);
+
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(SCL, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(SCL, LOW);
+    delayMicroseconds(5);
+  }
+
+  pinMode(SDA, OUTPUT);
+  digitalWrite(SDA, LOW);
+  delayMicroseconds(5);
+  digitalWrite(SCL, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(SDA, HIGH);
+  delayMicroseconds(5);
+
+  pinMode(SCL, INPUT_PULLUP);
+  pinMode(SDA, INPUT_PULLUP);
+}
+
+void wireReset() {
+  Wire.end();
+  delay(5);
+  Wire.begin();
+  Wire.setClock(100000);
+}
+
+bool readAS5600RawAngle(uint16_t &outAngle) {
+  Wire.beginTransmission((uint8_t)AS5600_ADDR);
+  Wire.write((uint8_t)AS5600_RAW_ANGLE_REG);
+  uint8_t e = Wire.endTransmission(false);
+  if (e != 0) return false;
+
+  uint8_t n = Wire.requestFrom((uint8_t)AS5600_ADDR, (uint8_t)2);
+  if (n != 2) return false;
+
+  uint16_t high = Wire.read();
+  uint16_t low  = Wire.read();
+  outAngle = ((high << 8) | low) & 0x0FFF;
+  return true;
+}
+
+/* ================= KEYPAD ================= */
+const byte ROWS = 4, COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte rowPins[ROWS] = {A1, A2, 5, 6};
+byte colPins[COLS] = {A3, A0, 7, 8};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+void handleKeypad() {
+  char key = keypad.getKey();
+  if (!key) return;
+
+  Serial.print("Key: ");
+  Serial.println(key);
+
+  if (key == '1') actuatorDelay = 300;
+  if (key == '2') actuatorDelay = 500;
+  if (key == '4') actuatorDelay = 700;
+  if (key == '5') actuatorDelay = 900;
+}
+
+/* ================= ACTUATOR CONTROL ================= */
+void handleActuator() {
+  if (millis() - lastChange >= actuatorDelay) {
+    lastChange = millis();
+    extendState = !extendState;
+    setActuatorUs(extendState ? POS_MAX : POS_MIN);
+  }
+}
+
+/* ================= ENCODER + LOGGING =================
+   Log only when movement since last save >= 2 degrees.
+   AS5600 is 12-bit => 4096 counts per 360 degrees.
+   2 degrees = 4096 * 2 / 360 = ~22.76 counts => use 23 counts.
+*/
+void handleEncoderAndLogging() {
+  static int32_t lastSavedCounter = 0;
+  static uint32_t lastSaveMs = 0;
+
+  const int32_t COUNTS_PER_2_DEG = 23;   // threshold
+
+  uint16_t a;
+  bool ok = readAS5600RawAngle(a);
+
+  if (!ok) {
+    i2cErrors++;
+    consecutiveI2cErrors++;
+    if (consecutiveI2cErrors == 10) {
+      i2cBusRecover();
+      wireReset();
+    }
+    return;
+  }
+
+  consecutiveI2cErrors = 0;
+  angleNow = a;
+
+  int16_t d = (int16_t)angleNow - (int16_t)anglePrev;
+  if (d > 2048)  d -= 4096;
+  if (d < -2048) d += 4096;
+
+  Counter += d;
+  anglePrev = angleNow;
+
+  // Save only if moved >= 2 degrees since last saved value
+  if (abs(Counter - lastSavedCounter) >= COUNTS_PER_2_DEG) {
+    sdLogLine(Counter, millis(), angleNow, i2cErrors);
+    lastSavedCounter = Counter;
+    lastSaveMs = millis();
+
+    Serial.print("Saved: ");
+    Serial.print(Counter);
+    Serial.print(" @ ");
+    Serial.println(lastSaveMs);
+  }
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin();
+  Wire.setClock(100000);
+
+  sdInitOrHalt();
+
+  actuator.attach(servoPin);
+  setActuatorUs(POS_STOP);
+
+  for (int i = 0; i < 20; i++) {
+    uint16_t a;
+    if (readAS5600RawAngle(a)) {
+      angleNow = anglePrev = a;
+      break;
+    }
+    delay(10);
+  }
+
+  Serial.println("Keypad: 1/2/4/5 changes actuator delay");
+  Serial.println("System Ready");
+}
+
+/* ================= LOOP ================= */
+void loop() {
+  handleKeypad();
+  handleEncoderAndLogging();
+  handleActuator();
+
+  static uint32_t lastFlush = 0;
+  if (millis() - lastFlush >= 1000) {
+    if (logFile) logFile.flush();
+    lastFlush = millis();
+  }
+
+  static uint32_t lastPrint = 0;
+  if (millis() - lastPrint >= 1000) {
+    lastPrint = millis();
+    Serial.print("Angle=");
+    Serial.print(angleNow);
+    Serial.print("  Counter=");
+    Serial.print(Counter);
+    Serial.print("  I2Cerr=");
+    Serial.print(i2cErrors);
+    Serial.print("  consec=");
+    Serial.println(consecutiveI2cErrors);
+  }
+}
