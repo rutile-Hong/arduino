@@ -4,4 +4,4 @@ arduino for rotor encoder(KY-040) and servo (HS-785HB)
 
 - 'pegasus_sd': Save data to sd, and pegasus actuator works fine, 2/22/2026
 
-- 'magneticencoder' : out windtest working
+- 'magneticencoder' : out windtest working 2/25/2026
