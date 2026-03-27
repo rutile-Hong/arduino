@@ -1,0 +1,171 @@
+#include <SD.h>
+#include <Keypad.h>
+#include <Servo.h>
+#include <Wire.h>
+
+/* ================= ACTUATOR ================= */
+Servo actuator;
+const int servoPin = 9;
+
+const int POS_MIN  = 1300;
+const int POS_MAX  = 1700;
+const int POS_STOP = 1500;
+const int POS_TEN  = 1400;
+const int POS_TWN  = 1600;
+
+// Target command
+int targetPos = POS_STOP;
+
+void setActuatorUs(int us) {
+  static int lastUs = -1;
+  if (us != lastUs) {
+    actuator.writeMicroseconds(us);
+    lastUs = us;
+  }
+}
+
+/* ================= SD ================= */
+const int SD_CS_PIN = 4;
+File logFile;
+
+void sdInitOrHalt() {
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH);
+
+  if (!SD.begin(SD_CS_PIN)) {
+    while (1) {}  // halt
+  }
+
+  logFile = SD.open("log.csv", FILE_WRITE);
+  if (!logFile) {
+    while (1) {}  // halt
+  }
+
+  if (logFile.size() == 0) {
+    logFile.println("count,timeMs,angle,i2cErr");
+    logFile.flush();
+  }
+}
+
+/* ================= TIMER / LOGGING ================= */
+uint32_t lastLogTime = 0;
+const uint32_t LOG_INTERVAL_US = 2000;
+
+/* ================= AS5600 ================= */
+#define AS5600_ADDR 0x36
+#define AS5600_RAW_ANGLE_REG 0x0C
+
+uint16_t angleNow = 0;
+uint16_t anglePrev = 0;
+int32_t Counter = 0;
+uint16_t i2cErrors = 0;
+
+bool readAS5600RawAngle(uint16_t &outAngle) {
+  Wire.beginTransmission(AS5600_ADDR);
+  Wire.write(AS5600_RAW_ANGLE_REG);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(AS5600_ADDR, 2) != 2) return false;
+
+  uint16_t high = Wire.read();
+  uint16_t low  = Wire.read();
+  outAngle = ((high << 8) | low) & 0x0FFF;
+  return true;
+}
+
+/* ================= KEYPAD ================= */
+const byte ROWS = 4, COLS = 4;
+
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte rowPins[ROWS] = {A1, A2, 5, 6};
+byte colPins[COLS] = {A3, A0, 7, 8};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+void handleKeypad() {
+  char key = keypad.getKey();
+  if (!key) return;
+
+  if (key == '1') targetPos = POS_MAX;
+  if (key == '2') targetPos = POS_TWN;
+  if (key == '4') targetPos = POS_MIN;
+  if (key == '5') targetPos = POS_STOP;
+}
+
+/* ================= ACTUATOR CONTROL ================= */
+void handleActuator() {
+  setActuatorUs(targetPos);
+}
+
+/* ================= LOGGING ================= */
+void handleEncoderAndLogging() {
+  uint32_t nowUs = micros();
+  if ((uint32_t)(nowUs - lastLogTime) < LOG_INTERVAL_US) return;
+  lastLogTime += LOG_INTERVAL_US;
+
+  uint16_t a;
+  if (!readAS5600RawAngle(a)) {
+    i2cErrors++;
+    return;
+  }
+
+  angleNow = a;
+
+  int16_t d = angleNow - anglePrev;
+  if (d > 2048)  d -= 4096;
+  if (d < -2048) d += 4096;
+
+  Counter += d;
+  anglePrev = angleNow;
+
+  unsigned long tMs = millis();
+
+  logFile.print((int32_t)Counter);
+  logFile.print(',');
+  logFile.print(tMs);
+  logFile.print(',');
+  logFile.print(angleNow);
+  logFile.print(',');
+  logFile.println(i2cErrors);
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin();
+  Wire.setClock(100000);
+
+  sdInitOrHalt();
+
+  actuator.attach(servoPin);
+  setActuatorUs(POS_STOP);
+
+  // Initialize encoder
+  for (int i = 0; i < 20; i++) {
+    uint16_t a;
+    if (readAS5600RawAngle(a)) {
+      angleNow = anglePrev = a;
+      break;
+    }
+    delay(10);
+  }
+}
+
+/* ================= LOOP ================= */
+void loop() {
+  handleKeypad();
+  handleActuator();
+  handleEncoderAndLogging();
+
+  static uint32_t lastFlush = 0;
+  if (millis() - lastFlush >= 50) {
+    logFile.flush();
+    lastFlush = millis();
+  }
+}
