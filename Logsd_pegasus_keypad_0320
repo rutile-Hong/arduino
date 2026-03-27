@@ -1,36 +1,26 @@
-#include <SPI.h>
 #include <SD.h>
 #include <Keypad.h>
 #include <Servo.h>
 #include <Wire.h>
 
 /* ================= ACTUATOR ================= */
-//changed save the data when the degree changed 0.4 degree
 Servo actuator;
 const int servoPin = 9;
-
 const int POS_MIN  = 1300;
 const int POS_MAX  = 1700;
 const int POS_STOP = 1500;
-
-// 🔥 dynamic amplitude
 int posMin = POS_MIN;
 int posMax = POS_MAX;
-
 const int BASE_DELAY = 800;
-const int BASE_AMP = (POS_STOP - POS_MIN); // 250
-
+const int BASE_AMP = (POS_STOP - POS_MIN);
 unsigned long actuatorDelay = 900;
 unsigned long lastChange = 0;
 bool extendState = false;
-
-// center hold
 bool centerHold = false;
 
 void updateAmplitude() {
   float scale = (float)actuatorDelay / BASE_DELAY;
-  int amp = BASE_AMP * scale;
-
+  int amp = BASE_AMP * scale*0.85;
   posMin = POS_STOP - amp;
   posMax = POS_STOP + amp;
 }
@@ -50,94 +40,40 @@ File logFile;
 void sdInitOrHalt() {
   pinMode(10, OUTPUT);
   digitalWrite(10, HIGH);
-
   if (!SD.begin(SD_CS_PIN)) {
-    Serial.println("SD init failed! (halt)");
-    while (1) {}
+    while (1) {}          // SD init failed -> halt
   }
 
   logFile = SD.open("log.csv", FILE_WRITE);
   if (!logFile) {
-    Serial.println("log.csv open failed! (halt)");
-    while (1) {}
+    while (1) {}          // file open failed -> halt
   }
 
+  // If file is empty, write CSV header
   if (logFile.size() == 0) {
     logFile.println("count,timeMs,angle,i2cErr");
     logFile.flush();
   }
-
-  Serial.println("SD Ready");
 }
 
-void sdLogLine(int32_t count, uint32_t timeMs, uint16_t angle, uint32_t i2cErr) {
-  if (!logFile) return;
-  logFile.print(count);
-  logFile.print(",");
-  logFile.print(timeMs);
-  logFile.print(",");
-  logFile.print(angle);
-  logFile.print(",");
-  logFile.println(i2cErr);
-}
+/* ================= TIMER / LOGGING ================= */
+uint32_t lastLogTime = 0;
+const uint32_t LOG_INTERVAL_US = 2000; // 2 ms
 
 /* ================= AS5600 ================= */
 #define AS5600_ADDR 0x36
-static const uint8_t AS5600_RAW_ANGLE_REG = 0x0C;
+#define AS5600_RAW_ANGLE_REG 0x0C
 
 uint16_t angleNow = 0;
 uint16_t anglePrev = 0;
 int32_t Counter = 0;
-
-uint32_t i2cErrors = 0;
-uint16_t consecutiveI2cErrors = 0;
-
-#ifndef SDA
-  #define SDA A4
-#endif
-#ifndef SCL
-  #define SCL A5
-#endif
-
-void i2cBusRecover() {
-  pinMode(SCL, OUTPUT);
-  pinMode(SDA, INPUT_PULLUP);
-
-  for (int i = 0; i < 9; i++) {
-    digitalWrite(SCL, HIGH);
-    delayMicroseconds(5);
-    digitalWrite(SCL, LOW);
-    delayMicroseconds(5);
-  }
-
-  pinMode(SDA, OUTPUT);
-  digitalWrite(SDA, LOW);
-  delayMicroseconds(5);
-  digitalWrite(SCL, HIGH);
-  delayMicroseconds(5);
-  digitalWrite(SDA, HIGH);
-  delayMicroseconds(5);
-
-  pinMode(SCL, INPUT_PULLUP);
-  pinMode(SDA, INPUT_PULLUP);
-}
-
-void wireReset() {
-  Wire.end();
-  delay(5);
-  Wire.begin();
-  Wire.setClock(100000);
-}
+uint16_t i2cErrors = 0;
 
 bool readAS5600RawAngle(uint16_t &outAngle) {
-  Wire.beginTransmission((uint8_t)AS5600_ADDR);
-  Wire.write((uint8_t)AS5600_RAW_ANGLE_REG);
-  uint8_t e = Wire.endTransmission(false);
-  if (e != 0) return false;
-
-  uint8_t n = Wire.requestFrom((uint8_t)AS5600_ADDR, (uint8_t)2);
-  if (n != 2) return false;
-
+  Wire.beginTransmission(AS5600_ADDR);
+  Wire.write(AS5600_RAW_ANGLE_REG);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(AS5600_ADDR, 2) != 2) return false;
   uint16_t high = Wire.read();
   uint16_t low  = Wire.read();
   outAngle = ((high << 8) | low) & 0x0FFF;
@@ -152,20 +88,14 @@ char keys[ROWS][COLS] = {
   {'7','8','9','C'},
   {'*','0','#','D'}
 };
-
 byte rowPins[ROWS] = {A1, A2, 5, 6};
 byte colPins[COLS] = {A3, A0, 7, 8};
-
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
 void handleKeypad() {
   char key = keypad.getKey();
   if (!key) return;
 
-  Serial.print("Key: ");
-  Serial.println(key);
-
-  // center hold
   if (key == '5') {
     centerHold = true;
     setActuatorUs(POS_STOP);
@@ -173,28 +103,22 @@ void handleKeypad() {
   }
 
   centerHold = false;
-
-  if (key == '1') actuatorDelay = 280;
+  if (key == '1') actuatorDelay = 400;
   if (key == '2') actuatorDelay = 500;
   if (key == '4') actuatorDelay = 800;
 
-  //
   updateAmplitude();
-
-  // Start center
   setActuatorUs(POS_STOP);
   lastChange = millis();
   extendState = false;
 }
 
-/* ================= ACTUATOR CONTROL ================= */
+/* ================= ACTUATOR ================= */
 void handleActuator() {
-
   if (centerHold) {
     setActuatorUs(POS_STOP);
     return;
   }
-
   if (millis() - lastChange >= actuatorDelay) {
     lastChange = millis();
     extendState = !extendState;
@@ -202,49 +126,40 @@ void handleActuator() {
   }
 }
 
-/* ================= ENCODER + LOGGING ================= */
+/* ================= LOGGING (CSV) ================= */
 void handleEncoderAndLogging() {
-  static int32_t lastSavedCounter = 0;
-
-  const int32_t COUNTS_PER_2_DEG = 3; //2deg = 24
+  uint32_t nowUs = micros();
+  if ((uint32_t)(nowUs - lastLogTime) < LOG_INTERVAL_US) return;
+  lastLogTime += LOG_INTERVAL_US;
 
   uint16_t a;
-  bool ok = readAS5600RawAngle(a);
-
-  if (!ok) {
+  if (!readAS5600RawAngle(a)) {
     i2cErrors++;
-    consecutiveI2cErrors++;
-    if (consecutiveI2cErrors == 10) {
-      i2cBusRecover();
-      wireReset();
-    }
     return;
   }
 
-  consecutiveI2cErrors = 0;
   angleNow = a;
-
-  int16_t d = (int16_t)angleNow - (int16_t)anglePrev;
+  int16_t d = angleNow - anglePrev;
   if (d > 2048)  d -= 4096;
   if (d < -2048) d += 4096;
-
   Counter += d;
   anglePrev = angleNow;
 
-  if (abs(Counter - lastSavedCounter) >= COUNTS_PER_2_DEG) {
-    sdLogLine(Counter, millis(), angleNow, i2cErrors);
-    lastSavedCounter = Counter;
+  // Log one CSV line: count,timeMs,angle,i2cErr
+  unsigned long tMs = millis();
 
-    Serial.print("Saved: ");
-    Serial.print(Counter);
-    Serial.println();
-  }
+  logFile.print((int32_t)Counter); // count (can be negative)
+  logFile.print(',');
+  logFile.print(tMs);              // timeMs
+  logFile.print(',');
+  logFile.print(angleNow);         // angle
+  logFile.print(',');
+  logFile.println(i2cErrors);      // i2cErr
 }
 
 /* ================= SETUP ================= */
 void setup() {
   Serial.begin(115200);
-
   Wire.begin();
   Wire.setClock(100000);
 
@@ -252,9 +167,9 @@ void setup() {
 
   actuator.attach(servoPin);
   setActuatorUs(POS_STOP);
+  updateAmplitude();
 
-  updateAmplitude(); // initial value
-
+  // Initialize angle reading
   for (int i = 0; i < 20; i++) {
     uint16_t a;
     if (readAS5600RawAngle(a)) {
@@ -263,8 +178,6 @@ void setup() {
     }
     delay(10);
   }
-
-  Serial.println("System Ready");
 }
 
 /* ================= LOOP ================= */
@@ -274,19 +187,8 @@ void loop() {
   handleActuator();
 
   static uint32_t lastFlush = 0;
-  if (millis() - lastFlush >= 1000) {
-    if (logFile) logFile.flush();
+  if (millis() - lastFlush >= 50) {
+    logFile.flush();    // ensure data is written
     lastFlush = millis();
-  }
-
-  static uint32_t lastPrint = 0;
-  if (millis() - lastPrint >= 1000) {
-    lastPrint = millis();
-    Serial.print("Angle=");
-    Serial.print(angleNow);
-    Serial.print(" Counter=");
-    Serial.print(Counter);
-    Serial.print(" I2Cerr=");
-    Serial.println(i2cErrors);
   }
 }
