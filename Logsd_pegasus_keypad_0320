@@ -118,7 +118,7 @@ void handleKeypad() {
 /* ================= ACTUATOR ================= */
 void handleActuator() {
   if (centerHold) {
-    setActuatorUs(POS_TWN); // POS_TWN : up10, POS_MAX : up25, POS_TEN :down10, POS_MIN :down25, POS_STOP : 0
+    setActuatorUs(POS_STOP); // POS_TWN : up10, POS_MAX : up25, POS_TEN :down10, POS_MIN :down25, POS_STOP : 0
     return;
   }
   if (millis() - lastChange >= actuatorDelay) {
