@@ -9,6 +9,8 @@ const int servoPin = 9;
 const int POS_MIN  = 1300;
 const int POS_MAX  = 1700;
 const int POS_STOP = 1500;
+const int POS_TEN  = 1400;
+const int POS_TWN  = 1600;
 int posMin = POS_MIN;
 int posMax = POS_MAX;
 const int BASE_DELAY = 800;
@@ -104,7 +106,7 @@ void handleKeypad() {
 
   centerHold = false;
   if (key == '1') actuatorDelay = 400;
-  if (key == '2') actuatorDelay = 500;
+  if (key == '2') actuatorDelay = 600;
   if (key == '4') actuatorDelay = 800;
 
   updateAmplitude();
@@ -116,7 +118,7 @@ void handleKeypad() {
 /* ================= ACTUATOR ================= */
 void handleActuator() {
   if (centerHold) {
-    setActuatorUs(POS_STOP);
+    setActuatorUs(POS_TWN); // POS_TWN : up10, POS_MAX : up25, POS_TEN :down10, POS_MIN :down25, POS_STOP : 0
     return;
   }
   if (millis() - lastChange >= actuatorDelay) {
