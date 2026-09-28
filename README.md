@@ -13,3 +13,5 @@ arduino for rotor encoder(AS5600) and servo (Pegasus Actuators GmbH PA-R-250-9)
 - 'DDS_Mode45' : changed the mode scale from 0.85 to 1.7 , works fine,   08/01/2026
 
 - 'Mode123_890': adding wire to get full keypad No., 123 same mode with previous, 4 increase amp and time double, 8 go to min_pos, 9 go to MAX_pos 0 is stop , works find, 08/04/26
+
+- 'abcd_added' : A = one-sided drift, B = stuck at one side, C = sudden full jump, D = reset
