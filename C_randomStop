@@ -1,0 +1,894 @@
+#include <Servo.h>
+#include <Keypad.h>
+#include <Wire.h>
+#include <SD.h>
+
+/* ==========================================================
+   ACTUATOR CONTROLLER
+
+   Commands (Keypad or Serial):
+   0 = Center hold
+   1 = Oscillation mode 1
+   2 = Oscillation mode 2
+   3 = Oscillation mode 3
+   4 = Maximum amplitude mode
+   A = PID drift failure
+   B = Abrupt jump failure
+   C = Random end-stop failure
+   D = Disable all fault modes
+
+   Mode C:
+   - Hold at center for random 100–999 ms
+   - Move randomly to MIN or MAX
+   - Hold for random 100–999 ms
+   - Return to center
+   - Repeat continuously
+
+   No Serial printing.
+   Continuous rotary encoder + SD logging.
+   ========================================================== */
+
+
+/* ==========================================================
+   ACTUATOR SETTINGS
+   ========================================================== */
+
+Servo actuator;
+
+const int servoPin = 9;
+
+const int POS_MIN  = 1100;
+const int POS_MAX  = 1800;
+const int POS_STOP = 1440;
+
+const int BASE_DELAY = 800;
+const int BASE_AMP   = 200;
+
+int posMin = POS_MIN;
+int posMax = POS_MAX;
+
+unsigned long actuatorDelay = 900;
+unsigned long lastChange = 0;
+
+bool extendState = false;
+bool centerHold = true;
+
+bool pidHoldFailMode = false;
+bool abruptStepFailMode = false;
+bool stuckFailMode = false;
+
+unsigned long holdFailStart = 0;
+
+int lastServoUs = POS_STOP;
+
+
+/* ==========================================================
+   MODE C: RANDOM HOLDING TIME
+   ========================================================== */
+
+// Random holding times: 100–999 milliseconds
+
+const long LIMIT_HOLD_MIN  = 100;
+const long LIMIT_HOLD_MAX  = 999;
+
+const long CENTER_HOLD_MIN = 100;
+const long CENTER_HOLD_MAX = 999;
+
+
+// Mode C states
+
+enum StuckPhase : uint8_t {
+
+  STUCK_AT_CENTER,
+  STUCK_AT_LIMIT
+
+};
+
+StuckPhase stuckPhase = STUCK_AT_CENTER;
+
+unsigned long stuckLastChange = 0;
+unsigned long stuckHoldDuration = 0;
+
+
+/* ==========================================================
+   SD CARD AND ENCODER
+   ========================================================== */
+
+const int SD_CS_PIN = 4;
+
+File logFile;
+
+#define AS5600_ADDR 0x36
+#define AS5600_RAW_ANGLE_REG 0x0C
+
+uint16_t angleNow = 0;
+uint16_t anglePrev = 0;
+
+int32_t Counter = 0;
+
+uint16_t i2cErrors = 0;
+
+// Encoder logging interval in microseconds.
+// Actual rate depends on I2C and SD performance.
+
+const uint32_t LOG_INTERVAL_US = 500;
+
+// Flush periodically.
+
+const uint32_t SD_FLUSH_INTERVAL_MS = 20;
+
+
+/* ==========================================================
+   KEYPAD CONFIGURATION
+   ========================================================== */
+
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] = {
+
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+
+};
+
+byte rowPins[ROWS] = {
+
+  A1, A2, 5, 6
+
+};
+
+byte colPins[COLS] = {
+
+  A3, A0, 7, 8
+
+};
+
+Keypad keypad = Keypad(
+
+  makeKeymap(keys),
+  rowPins,
+  colPins,
+  ROWS,
+  COLS
+
+);
+
+
+/* ==========================================================
+   ACTUATOR FUNCTIONS
+   ========================================================== */
+
+void updateAmplitude() {
+
+  float scale = (float)actuatorDelay / BASE_DELAY;
+
+  int amp = BASE_AMP * scale;
+
+  posMin = POS_STOP - amp;
+  posMax = POS_STOP + amp;
+
+  // Keep normal oscillation within configured limits.
+
+  posMin = constrain(posMin, POS_MIN, POS_MAX);
+  posMax = constrain(posMax, POS_MIN, POS_MAX);
+}
+
+
+void setActuatorUs(int us) {
+
+  static int lastUs = -1;
+
+  us = constrain(us, POS_MIN, POS_MAX);
+
+  lastServoUs = us;
+
+  if (us != lastUs) {
+
+    actuator.writeMicroseconds(us);
+
+    lastUs = us;
+
+  }
+}
+
+
+/* ==========================================================
+   AS5600 ROTARY ENCODER
+   ========================================================== */
+
+bool readAS5600RawAngle(uint16_t &outAngle) {
+
+  Wire.beginTransmission(AS5600_ADDR);
+
+  Wire.write(AS5600_RAW_ANGLE_REG);
+
+  if (Wire.endTransmission(false) != 0) {
+
+    return false;
+
+  }
+
+  if (Wire.requestFrom(AS5600_ADDR, 2) != 2) {
+
+    return false;
+
+  }
+
+  uint16_t high = Wire.read();
+  uint16_t low  = Wire.read();
+
+  outAngle = ((high << 8) | low) & 0x0FFF;
+
+  return true;
+}
+
+
+/* ==========================================================
+   SD INITIALIZATION
+   ========================================================== */
+
+void sdInitOrHalt() {
+
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH);
+
+  if (!SD.begin(SD_CS_PIN)) {
+
+    // Stop if SD initialization fails.
+
+    while (1) {
+
+      // No Serial printing.
+
+    }
+  }
+
+  logFile = SD.open("vein_log.csv", FILE_WRITE);
+
+  if (!logFile) {
+
+    // Stop if log file cannot be opened.
+
+    while (1) {
+
+      // No Serial printing.
+
+    }
+  }
+
+  if (logFile.size() == 0) {
+
+    logFile.println(F("count,timeMs,angle,i2cErr"));
+
+    logFile.flush();
+
+  }
+}
+
+
+/* ==========================================================
+   ROTARY ENCODER LOGGING
+   ========================================================== */
+
+void handleEncoderAndLogging() {
+
+  static uint32_t lastLogTime = 0;
+
+  uint32_t nowUs = micros();
+
+  if ((uint32_t)(nowUs - lastLogTime)
+      < LOG_INTERVAL_US) {
+
+    return;
+
+  }
+
+  // Use the actual sampling time instead of attempting
+  // to catch up after a slow SD write.
+
+  lastLogTime = nowUs;
+
+  uint16_t a;
+
+  if (!readAS5600RawAngle(a)) {
+
+    i2cErrors++;
+
+    return;
+
+  }
+
+  angleNow = a;
+
+  int16_t d = angleNow - anglePrev;
+
+  // Handle encoder rollover.
+
+  if (d > 2048) {
+
+    d -= 4096;
+
+  }
+
+  if (d < -2048) {
+
+    d += 4096;
+
+  }
+
+  Counter += d;
+
+  anglePrev = angleNow;
+
+  unsigned long tMs = millis();
+
+
+  // Write encoder information to SD card.
+
+  logFile.print(Counter);
+  logFile.print(',');
+
+  logFile.print(tMs);
+  logFile.print(',');
+
+  logFile.print(angleNow);
+  logFile.print(',');
+
+  logFile.println(i2cErrors);
+}
+
+
+/* ==========================================================
+   NORMAL OSCILLATION MODES
+   ========================================================== */
+
+void setMode(int mode) {
+
+  switch (mode) {
+
+    case 1:
+
+      actuatorDelay = 340;
+      break;
+
+    case 2:
+
+      actuatorDelay = 510;
+      break;
+
+    case 3:
+
+      actuatorDelay = 680;
+      break;
+
+    case 4:
+
+      actuatorDelay = 1360;
+      break;
+
+    default:
+
+      actuatorDelay = 900;
+      break;
+
+  }
+
+
+  // Disable failure modes.
+
+  pidHoldFailMode = false;
+  abruptStepFailMode = false;
+  stuckFailMode = false;
+
+  centerHold = false;
+
+  extendState = false;
+
+  updateAmplitude();
+
+  setActuatorUs(POS_STOP);
+
+  lastChange = millis();
+}
+
+
+/* ==========================================================
+   COMMAND HANDLER
+   ========================================================== */
+
+void handleCommand(char key) {
+
+  switch (key) {
+
+
+    /* ------------------------------------------------------
+       0: CENTER HOLD
+       ------------------------------------------------------ */
+
+    case '0':
+
+      pidHoldFailMode = false;
+      abruptStepFailMode = false;
+      stuckFailMode = false;
+
+      centerHold = true;
+
+      setActuatorUs(POS_STOP);
+
+      break;
+
+
+    /* ------------------------------------------------------
+       1–4: NORMAL OSCILLATION
+       ------------------------------------------------------ */
+
+    case '1':
+    case '2':
+    case '3':
+    case '4':
+
+      setMode(key - '0');
+
+      break;
+
+
+    /* ------------------------------------------------------
+       A: PID DRIFT FAILURE
+       ------------------------------------------------------ */
+
+    case 'A':
+
+      pidHoldFailMode = !pidHoldFailMode;
+
+      abruptStepFailMode = false;
+      stuckFailMode = false;
+
+      centerHold = true;
+
+      holdFailStart = millis();
+
+      if (!pidHoldFailMode) {
+
+        setActuatorUs(POS_STOP);
+
+      }
+
+      break;
+
+
+    /* ------------------------------------------------------
+       B: ABRUPT JUMP FAILURE
+       ------------------------------------------------------ */
+
+    case 'B':
+
+      abruptStepFailMode = !abruptStepFailMode;
+
+      pidHoldFailMode = false;
+      stuckFailMode = false;
+
+      centerHold = true;
+
+      holdFailStart = millis();
+
+      if (!abruptStepFailMode) {
+
+        setActuatorUs(POS_STOP);
+
+      }
+
+      break;
+
+
+    /* ------------------------------------------------------
+       C: RANDOM END-STOP FAILURE
+       ------------------------------------------------------ */
+
+    case 'C':
+
+      stuckFailMode = !stuckFailMode;
+
+      pidHoldFailMode = false;
+      abruptStepFailMode = false;
+
+      centerHold = true;
+
+
+      if (stuckFailMode) {
+
+        // Always begin at center.
+
+        stuckPhase = STUCK_AT_CENTER;
+
+        stuckLastChange = millis();
+
+
+        // Random center holding time.
+
+        stuckHoldDuration = random(
+
+          CENTER_HOLD_MIN,
+          CENTER_HOLD_MAX + 1
+
+        );
+
+      }
+
+
+      setActuatorUs(POS_STOP);
+
+      break;
+
+
+    /* ------------------------------------------------------
+       D: DISABLE ALL FAULT MODES
+       ------------------------------------------------------ */
+
+    case 'D':
+
+      pidHoldFailMode = false;
+      abruptStepFailMode = false;
+      stuckFailMode = false;
+
+      centerHold = true;
+
+      setActuatorUs(POS_STOP);
+
+      break;
+
+
+    default:
+
+      break;
+
+  }
+}
+
+
+/* ==========================================================
+   ACTUATOR CONTROL
+   ========================================================== */
+
+void handleActuator() {
+
+  unsigned long now = millis();
+
+
+  /* ========================================================
+     CENTER HOLD AND FAILURE MODES
+     ======================================================== */
+
+  if (centerHold) {
+
+
+    /* ------------------------------------------------------
+       MODE A: PID DRIFT FAILURE
+       ------------------------------------------------------ */
+
+    if (pidHoldFailMode) {
+
+      unsigned long dt = now - holdFailStart;
+
+      int drift = 0;
+
+
+      if (dt < 1500) {
+
+        drift = map(
+
+          dt,
+          0,
+          1500,
+          0,
+          180
+
+        );
+
+      } else {
+
+        drift = 180
+                + ((int)((dt / 350) % 8) - 3) * 35;
+
+      }
+
+
+      if ((dt / 450) % 2 == 0) {
+
+        drift = -drift;
+
+      }
+
+
+      setActuatorUs(POS_STOP + drift);
+
+      return;
+
+    }
+
+
+    /* ------------------------------------------------------
+       MODE B: ABRUPT JUMP FAILURE
+       ------------------------------------------------------ */
+
+    if (abruptStepFailMode) {
+
+      unsigned long dt = now - holdFailStart;
+
+      int step = ((dt / 400) % 2 == 0)
+                 ? 220
+                 : -220;
+
+      setActuatorUs(POS_STOP + step);
+
+      return;
+
+    }
+
+
+    /* ======================================================
+       MODE C: RANDOM END-STOP FAILURE
+       ====================================================== */
+
+    if (stuckFailMode) {
+
+
+      // Nonblocking random holding timer.
+
+      if (now - stuckLastChange >= stuckHoldDuration) {
+
+        stuckLastChange = now;
+
+
+        /* --------------------------------------------------
+           CENTER -> RANDOM LIMIT
+           -------------------------------------------------- */
+
+        if (stuckPhase == STUCK_AT_CENTER) {
+
+
+          // Randomly select MIN or MAX.
+
+          int target;
+
+          if (random(0, 2) == 0) {
+
+            target = POS_MIN;
+
+          } else {
+
+            target = POS_MAX;
+
+          }
+
+
+          setActuatorUs(target);
+
+          stuckPhase = STUCK_AT_LIMIT;
+
+
+          // Random hold at selected limit.
+
+          stuckHoldDuration = random(
+
+            LIMIT_HOLD_MIN,
+            LIMIT_HOLD_MAX + 1
+
+          );
+
+        }
+
+
+        /* --------------------------------------------------
+           LIMIT -> CENTER
+           -------------------------------------------------- */
+
+        else {
+
+
+          setActuatorUs(POS_STOP);
+
+          stuckPhase = STUCK_AT_CENTER;
+
+
+          // Random hold at center.
+
+          stuckHoldDuration = random(
+
+            CENTER_HOLD_MIN,
+            CENTER_HOLD_MAX + 1
+
+          );
+
+        }
+
+      }
+
+
+      return;
+
+    }
+
+
+    /* ------------------------------------------------------
+       NORMAL CENTER HOLD
+       ------------------------------------------------------ */
+
+    setActuatorUs(POS_STOP);
+
+    return;
+
+  }
+
+
+  /* ========================================================
+     NORMAL OSCILLATION
+     ======================================================== */
+
+  if (now - lastChange >= actuatorDelay) {
+
+    lastChange = now;
+
+    extendState = !extendState;
+
+    setActuatorUs(
+
+      extendState ? posMax : posMin
+
+    );
+
+  }
+}
+
+
+/* ==========================================================
+   SETUP
+   ========================================================== */
+
+void setup() {
+
+
+  // Serial input only.
+  // No Serial output.
+
+  Serial.begin(115200);
+
+
+  // Initialize actuator first.
+
+  actuator.attach(servoPin);
+
+  setActuatorUs(POS_STOP);
+
+
+  // Initialize I2C.
+
+  Wire.begin();
+
+  Wire.setClock(100000);
+
+
+  // Initialize encoder before logging.
+
+  bool encoderInitialized = false;
+
+  for (int i = 0; i < 20; i++) {
+
+    uint16_t a;
+
+    if (readAS5600RawAngle(a)) {
+
+      angleNow = a;
+
+      anglePrev = a;
+
+      encoderInitialized = true;
+
+      break;
+
+    }
+
+    delay(10);
+
+  }
+
+
+  // Initialize random generator.
+
+  randomSeed(micros());
+
+
+  // Initialize SD logging.
+
+  sdInitOrHalt();
+
+
+  // Start in center hold mode.
+
+  centerHold = true;
+
+  setActuatorUs(POS_STOP);
+
+}
+
+
+/* ==========================================================
+   MAIN LOOP
+   ========================================================== */
+
+void loop() {
+
+
+  /* --------------------------------------------------------
+     1. READ KEYPAD
+     -------------------------------------------------------- */
+
+  char key = keypad.getKey();
+
+  if (key != NO_KEY) {
+
+    handleCommand(key);
+
+  }
+
+
+  /* --------------------------------------------------------
+     2. READ SERIAL COMMANDS
+     -------------------------------------------------------- */
+
+  if (Serial.available() > 0) {
+
+    char cmd = Serial.read();
+
+    if (cmd != '\n' && cmd != '\r') {
+
+
+      // Convert lowercase commands to uppercase.
+
+      if (cmd >= 'a' && cmd <= 'd') {
+
+        cmd -= 32;
+
+      }
+
+
+      handleCommand(cmd);
+
+    }
+
+  }
+
+
+  /* --------------------------------------------------------
+     3. ROTARY ENCODER LOGGING
+     -------------------------------------------------------- */
+
+  handleEncoderAndLogging();
+
+
+  /* --------------------------------------------------------
+     4. ACTUATOR CONTROL
+     -------------------------------------------------------- */
+
+  handleActuator();
+
+
+  /* --------------------------------------------------------
+     5. PERIODIC SD FLUSH
+     -------------------------------------------------------- */
+
+  static uint32_t lastFlush = 0;
+
+  uint32_t now = millis();
+
+  if (now - lastFlush >= SD_FLUSH_INTERVAL_MS) {
+
+    logFile.flush();
+
+    lastFlush = now;
+
+  }
+
+}
