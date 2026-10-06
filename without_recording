@@ -1,0 +1,1341 @@
+#include <Servo.h>
+#include <Keypad.h>
+#include <Wire.h>
+#include <SD.h>
+
+/* ============================================================
+   TEENSY 4.1
+   KEYPAD + ACTUATOR + AS5600 + SD LOGGING
+
+   Keypad:
+     R1-R4 = 24,25,26,27
+     C1-C4 = 28,29,30,31
+
+   Actuator:
+     Signal = pin 10
+
+   AS5600:
+     SDA = pin 18
+     SCL = pin 19
+
+   SD:
+     Teensy 4.1 built-in microSD
+
+   Log files:
+     vain1.csv
+     vain2.csv
+     vain3.csv
+     ...
+   ============================================================ */
+
+
+/* ============================================================
+   ACTUATOR
+   ============================================================ */
+
+Servo actuator;
+
+const int SERVO_PIN = 10;
+
+const int POS_MIN  = 1100;
+const int POS_MAX  = 1800;
+const int POS_STOP = 1440;
+
+const int BASE_DELAY = 800;
+const int BASE_AMP   = 200;
+
+
+/* ============================================================
+   AS5600
+   ============================================================ */
+
+const uint8_t AS5600_ADDR = 0x36;
+const uint8_t AS5600_RAW_ANGLE_REG = 0x0C;
+
+uint16_t angleNow = 0;
+uint16_t anglePrev = 0;
+
+int32_t Counter = 0;
+
+uint16_t i2cErrors = 0;
+
+
+/* ============================================================
+   SD LOGGING
+   ============================================================ */
+
+File logFile;
+
+bool sdOK = false;
+
+const uint32_t LOG_INTERVAL_US = 10000;   // 100 Hz
+
+uint32_t lastLogTimeUs = 0;
+
+
+/* ============================================================
+   MODE TIMES
+   ============================================================ */
+
+const uint32_t modeDelay[4] =
+{
+  340,
+  510,
+  680,
+  1360
+};
+
+
+/* ============================================================
+   ACTUATOR VARIABLES
+   ============================================================ */
+
+int posMin = POS_MIN;
+int posMax = POS_MAX;
+
+uint32_t actuatorDelay = 900;
+uint32_t lastChange = 0;
+
+bool extendState = false;
+
+int lastServoUs = POS_STOP;
+
+
+/* ============================================================
+   MOTION TYPE
+   ============================================================ */
+
+enum MotionType
+{
+  MOTION_CENTER,
+  MOTION_NORMAL,
+  MOTION_CENTER_REST,
+  MOTION_MAX
+};
+
+MotionType motionType = MOTION_CENTER;
+
+uint8_t motionStep = 0;
+uint8_t mode9TimingIndex = 0;
+
+int currentMode = 0;
+
+char lastKeyPressed = '-';
+
+
+/* ============================================================
+   KEYPAD
+   ============================================================ */
+
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] =
+{
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte rowPins[ROWS] =
+{
+  24,
+  25,
+  26,
+  27
+};
+
+byte colPins[COLS] =
+{
+  28,
+  29,
+  30,
+  31
+};
+
+Keypad keypad = Keypad(
+  makeKeymap(keys),
+  rowPins,
+  colPins,
+  ROWS,
+  COLS
+);
+
+
+/* ============================================================
+   SERVO COMMAND
+   ============================================================ */
+
+void setActuatorUs(int us)
+{
+  us = constrain(
+    us,
+    POS_MIN,
+    POS_MAX
+  );
+
+  lastServoUs = us;
+
+  actuator.writeMicroseconds(us);
+}
+
+
+/* ============================================================
+   CALCULATE AMPLITUDE
+   ============================================================ */
+
+void updateAmplitude()
+{
+  float scale =
+    (float)actuatorDelay /
+    (float)BASE_DELAY;
+
+  int amp =
+    (int)(
+      BASE_AMP * scale
+    );
+
+  int maximumSymmetricAmplitude =
+    min(
+      POS_STOP - POS_MIN,
+      POS_MAX - POS_STOP
+    );
+
+  amp = constrain(
+    amp,
+    0,
+    maximumSymmetricAmplitude
+  );
+
+  posMin =
+    POS_STOP - amp;
+
+  posMax =
+    POS_STOP + amp;
+}
+
+
+/* ============================================================
+   READ AS5600 RAW ANGLE
+   ============================================================ */
+
+bool readAS5600RawAngle(uint16_t &outAngle)
+{
+  Wire.beginTransmission(
+    AS5600_ADDR
+  );
+
+  Wire.write(
+    AS5600_RAW_ANGLE_REG
+  );
+
+  if (
+    Wire.endTransmission(false) != 0
+  )
+  {
+    return false;
+  }
+
+  if (
+    Wire.requestFrom(
+      (uint8_t)AS5600_ADDR,
+      (uint8_t)2
+    ) != 2
+  )
+  {
+    return false;
+  }
+
+  uint16_t high =
+    Wire.read();
+
+  uint16_t low =
+    Wire.read();
+
+  outAngle =
+    ((high << 8) | low)
+    & 0x0FFF;
+
+  return true;
+}
+
+
+/* ============================================================
+   UPDATE AS5600 CONTINUOUS COUNTER
+   ============================================================ */
+
+void updateEncoder()
+{
+  uint16_t a;
+
+  if (!readAS5600RawAngle(a))
+  {
+    i2cErrors++;
+    return;
+  }
+
+  angleNow =
+    a;
+
+  int16_t d =
+    (int16_t)angleNow -
+    (int16_t)anglePrev;
+
+
+  /* Handle rollover */
+
+  if (d > 2048)
+  {
+    d -= 4096;
+  }
+
+  if (d < -2048)
+  {
+    d += 4096;
+  }
+
+
+  Counter +=
+    d;
+
+  anglePrev =
+    angleNow;
+}
+
+
+/* ============================================================
+   SD INITIALIZATION
+   ============================================================ */
+
+void initSD()
+{
+  Serial.println(
+    "Initializing SD..."
+  );
+
+  if (!SD.begin(BUILTIN_SDCARD))
+  {
+    Serial.println(
+      "SD FAILED - actuator will still work."
+    );
+
+    sdOK = false;
+
+    return;
+  }
+
+
+  char fileName[24];
+
+  int fileNumber =
+    1;
+
+
+  while (true)
+  {
+    snprintf(
+      fileName,
+      sizeof(fileName),
+      "vain%d.csv",
+      fileNumber
+    );
+
+
+    if (!SD.exists(fileName))
+    {
+      break;
+    }
+
+
+    fileNumber++;
+
+
+    if (fileNumber > 9999)
+    {
+      Serial.println(
+        "ERROR: Too many log files."
+      );
+
+      sdOK = false;
+
+      return;
+    }
+  }
+
+
+  logFile =
+    SD.open(
+      fileName,
+      FILE_WRITE
+    );
+
+
+  if (!logFile)
+  {
+    Serial.println(
+      "Cannot create log file."
+    );
+
+    sdOK = false;
+
+    return;
+  }
+
+
+  sdOK =
+    true;
+
+
+  logFile.println(
+    "timeUs,timeMs,angle,Counter,i2cErrors,servoUs,mode,key"
+  );
+
+
+  logFile.flush();
+
+
+  Serial.print(
+    "SD READY - Logging to: "
+  );
+
+  Serial.println(
+    fileName
+  );
+}
+
+
+/* ============================================================
+   SD LOGGING
+   ============================================================ */
+
+void handleLogging()
+{
+  uint32_t nowUs =
+    micros();
+
+
+  if (
+    (uint32_t)(
+      nowUs - lastLogTimeUs
+    ) < LOG_INTERVAL_US
+  )
+  {
+    return;
+  }
+
+
+  lastLogTimeUs =
+    nowUs;
+
+
+  if (!sdOK)
+  {
+    return;
+  }
+
+
+  uint32_t nowMs =
+    millis();
+
+
+  logFile.print(
+    nowUs
+  );
+
+  logFile.print(',');
+
+
+  logFile.print(
+    nowMs
+  );
+
+  logFile.print(',');
+
+
+  logFile.print(
+    angleNow
+  );
+
+  logFile.print(',');
+
+
+  logFile.print(
+    Counter
+  );
+
+  logFile.print(',');
+
+
+  logFile.print(
+    i2cErrors
+  );
+
+  logFile.print(',');
+
+
+  logFile.print(
+    lastServoUs
+  );
+
+  logFile.print(',');
+
+
+  logFile.print(
+    currentMode
+  );
+
+  logFile.print(',');
+
+
+  logFile.println(
+    lastKeyPressed
+  );
+}
+
+
+/* ============================================================
+   MODE 0
+   ============================================================ */
+
+void setCenter()
+{
+  currentMode =
+    0;
+
+  motionType =
+    MOTION_CENTER;
+
+  setActuatorUs(
+    POS_STOP
+  );
+
+  Serial.println(
+    "Actuator -> CENTER"
+  );
+}
+
+
+/* ============================================================
+   MODES 1-4
+   ============================================================ */
+
+void setNormalMode(int mode)
+{
+  currentMode =
+    mode;
+
+  actuatorDelay =
+    modeDelay[
+      mode - 1
+    ];
+
+  updateAmplitude();
+
+  motionType =
+    MOTION_NORMAL;
+
+  extendState =
+    false;
+
+  setActuatorUs(
+    POS_STOP
+  );
+
+  lastChange =
+    millis();
+
+
+  Serial.print(
+    "Mode "
+  );
+
+  Serial.print(
+    mode
+  );
+
+  Serial.print(
+    " | MIN = "
+  );
+
+  Serial.print(
+    posMin
+  );
+
+  Serial.print(
+    " | MAX = "
+  );
+
+  Serial.print(
+    posMax
+  );
+
+  Serial.print(
+    " | Time = "
+  );
+
+  Serial.print(
+    actuatorDelay
+  );
+
+  Serial.println(
+    " ms"
+  );
+}
+
+
+/* ============================================================
+   MODES 5-8
+   ============================================================ */
+
+void setCenterRestMode(int mode)
+{
+  currentMode =
+    mode;
+
+  int profile =
+    mode - 5;
+
+  actuatorDelay =
+    modeDelay[
+      profile
+    ];
+
+  updateAmplitude();
+
+  motionType =
+    MOTION_CENTER_REST;
+
+  motionStep =
+    0;
+
+  setActuatorUs(
+    POS_STOP
+  );
+
+  lastChange =
+    millis();
+
+
+  Serial.print(
+    "Mode "
+  );
+
+  Serial.print(
+    mode
+  );
+
+  Serial.print(
+    " | CENTER REST | MIN = "
+  );
+
+  Serial.print(
+    posMin
+  );
+
+  Serial.print(
+    " | MAX = "
+  );
+
+  Serial.print(
+    posMax
+  );
+
+  Serial.print(
+    " | Time = "
+  );
+
+  Serial.print(
+    actuatorDelay
+  );
+
+  Serial.println(
+    " ms"
+  );
+}
+
+
+/* ============================================================
+   MODE 9
+   ============================================================ */
+
+void setMode9()
+{
+  currentMode =
+    9;
+
+  motionType =
+    MOTION_MAX;
+
+  motionStep =
+    0;
+
+  mode9TimingIndex =
+    0;
+
+  actuatorDelay =
+    modeDelay[0];
+
+  setActuatorUs(
+    POS_STOP
+  );
+
+  lastChange =
+    millis();
+
+  Serial.println(
+    "Mode 9 FULL TRAVEL"
+  );
+}
+
+
+/* ============================================================
+   COMMAND HANDLER
+   ============================================================ */
+
+void handleCommand(char key)
+{
+  switch (key)
+  {
+    case '0':
+
+      setCenter();
+
+      break;
+
+
+    case '1':
+    case '2':
+    case '3':
+    case '4':
+
+      setNormalMode(
+        key - '0'
+      );
+
+      break;
+
+
+    case '5':
+    case '6':
+    case '7':
+    case '8':
+
+      setCenterRestMode(
+        key - '0'
+      );
+
+      break;
+
+
+    case '9':
+
+      setMode9();
+
+      break;
+
+
+    case 'D':
+
+      setCenter();
+
+      Serial.println(
+        "STOP / CENTER"
+      );
+
+      break;
+
+
+    case '#':
+
+      Counter =
+        0;
+
+      anglePrev =
+        angleNow;
+
+      Serial.println(
+        "Encoder Counter reset"
+      );
+
+      break;
+
+
+    case 'A':
+
+      Serial.println(
+        "A pressed"
+      );
+
+      break;
+
+
+    case 'B':
+
+      Serial.println(
+        "B pressed"
+      );
+
+      break;
+
+
+    case 'C':
+
+      Serial.println(
+        "C pressed"
+      );
+
+      break;
+
+
+    case '*':
+
+      Serial.println(
+        "* pressed"
+      );
+
+      break;
+
+
+    default:
+
+      break;
+  }
+}
+
+
+/* ============================================================
+   NORMAL MOTION
+   ============================================================ */
+
+void handleNormalMotion()
+{
+  uint32_t now =
+    millis();
+
+
+  if (
+    now - lastChange <
+    actuatorDelay
+  )
+  {
+    return;
+  }
+
+
+  lastChange =
+    now;
+
+
+  extendState =
+    !extendState;
+
+
+  if (extendState)
+  {
+    setActuatorUs(
+      posMax
+    );
+  }
+
+  else
+  {
+    setActuatorUs(
+      posMin
+    );
+  }
+}
+
+
+/* ============================================================
+   CENTER REST MOTION
+   ============================================================ */
+
+void handleCenterRestMotion()
+{
+  uint32_t now =
+    millis();
+
+
+  if (
+    now - lastChange <
+    actuatorDelay
+  )
+  {
+    return;
+  }
+
+
+  lastChange =
+    now;
+
+
+  switch (motionStep)
+  {
+    case 0:
+
+      setActuatorUs(
+        posMax
+      );
+
+      motionStep =
+        1;
+
+      break;
+
+
+    case 1:
+
+      setActuatorUs(
+        POS_STOP
+      );
+
+      motionStep =
+        2;
+
+      break;
+
+
+    case 2:
+
+      setActuatorUs(
+        posMin
+      );
+
+      motionStep =
+        3;
+
+      break;
+
+
+    default:
+
+      setActuatorUs(
+        POS_STOP
+      );
+
+      motionStep =
+        0;
+
+      break;
+  }
+}
+
+
+/* ============================================================
+   MODE 9
+   ============================================================ */
+
+void handleMode9()
+{
+  uint32_t now =
+    millis();
+
+
+  if (
+    now - lastChange <
+    actuatorDelay
+  )
+  {
+    return;
+  }
+
+
+  lastChange =
+    now;
+
+
+  switch (motionStep)
+  {
+    case 0:
+
+      setActuatorUs(
+        POS_MAX
+      );
+
+      motionStep =
+        1;
+
+      break;
+
+
+    case 1:
+
+      setActuatorUs(
+        POS_STOP
+      );
+
+      motionStep =
+        2;
+
+      break;
+
+
+    case 2:
+
+      setActuatorUs(
+        POS_MIN
+      );
+
+      motionStep =
+        3;
+
+      break;
+
+
+    default:
+
+      setActuatorUs(
+        POS_STOP
+      );
+
+
+      motionStep =
+        0;
+
+
+      mode9TimingIndex++;
+
+
+      if (
+        mode9TimingIndex >= 4
+      )
+      {
+        mode9TimingIndex =
+          0;
+      }
+
+
+      actuatorDelay =
+        modeDelay[
+          mode9TimingIndex
+        ];
+
+
+      Serial.print(
+        "Mode 9 timing = "
+      );
+
+      Serial.print(
+        actuatorDelay
+      );
+
+      Serial.println(
+        " ms"
+      );
+
+      break;
+  }
+}
+
+
+/* ============================================================
+   ACTUATOR HANDLER
+   ============================================================ */
+
+void handleActuator()
+{
+  switch (motionType)
+  {
+    case MOTION_CENTER:
+
+      break;
+
+
+    case MOTION_NORMAL:
+
+      handleNormalMotion();
+
+      break;
+
+
+    case MOTION_CENTER_REST:
+
+      handleCenterRestMotion();
+
+      break;
+
+
+    case MOTION_MAX:
+
+      handleMode9();
+
+      break;
+  }
+}
+
+
+/* ============================================================
+   SETUP
+   ============================================================ */
+
+void setup()
+{
+  Serial.begin(
+    115200
+  );
+
+
+  delay(
+    1000
+  );
+
+
+  /* ==========================================================
+     KEYPAD
+     ========================================================== */
+
+  keypad.setDebounceTime(
+    50
+  );
+
+
+  /* ==========================================================
+     ACTUATOR
+     ========================================================== */
+
+  actuator.attach(
+    SERVO_PIN
+  );
+
+
+  setActuatorUs(
+    POS_STOP
+  );
+
+
+  /* ==========================================================
+     I2C / AS5600
+
+     Teensy 4.1:
+     SDA = 18
+     SCL = 19
+     ========================================================== */
+
+  Wire.begin();
+
+
+  Wire.setClock(
+    400000
+  );
+
+
+  bool encoderFound =
+    false;
+
+
+  for (
+    int i = 0;
+    i < 20;
+    i++
+  )
+  {
+    uint16_t a;
+
+
+    if (
+      readAS5600RawAngle(a)
+    )
+    {
+      angleNow =
+        a;
+
+      anglePrev =
+        a;
+
+      encoderFound =
+        true;
+
+      break;
+    }
+
+
+    delay(
+      10
+    );
+  }
+
+
+  if (encoderFound)
+  {
+    Serial.print(
+      "AS5600 READY | Initial angle = "
+    );
+
+    Serial.println(
+      angleNow
+    );
+  }
+
+  else
+  {
+    Serial.println(
+      "WARNING: AS5600 not detected"
+    );
+  }
+
+
+  /* ==========================================================
+     SD
+     ========================================================== */
+
+  initSD();
+
+
+  /* ==========================================================
+     STARTUP
+     ========================================================== */
+
+  Serial.println();
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "TEENSY 4.1 CONTROLLER"
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println();
+
+  Serial.println(
+    "Keypad rows : 24 25 26 27"
+  );
+
+  Serial.println(
+    "Keypad cols : 28 29 30 31"
+  );
+
+  Serial.println(
+    "Actuator    : pin 10"
+  );
+
+  Serial.println(
+    "AS5600 SDA  : pin 18"
+  );
+
+  Serial.println(
+    "AS5600 SCL  : pin 19"
+  );
+
+  Serial.println();
+
+  Serial.println(
+    "0   = CENTER"
+  );
+
+  Serial.println(
+    "1-4 = NORMAL"
+  );
+
+  Serial.println(
+    "5-8 = CENTER REST"
+  );
+
+  Serial.println(
+    "9   = FULL TRAVEL"
+  );
+
+  Serial.println(
+    "D   = STOP/CENTER"
+  );
+
+  Serial.println(
+    "#   = RESET ENCODER COUNTER"
+  );
+
+  Serial.println();
+
+  Serial.println(
+    "READY"
+  );
+}
+
+
+/* ============================================================
+   LOOP
+   ============================================================ */
+
+void loop()
+{
+  /* ==========================================================
+     KEYPAD
+     ========================================================== */
+
+  char key =
+    keypad.getKey();
+
+
+  if (key != NO_KEY)
+  {
+    lastKeyPressed =
+      key;
+
+
+    Serial.print(
+      "["
+    );
+
+    Serial.print(
+      millis()
+    );
+
+    Serial.print(
+      " ms] Pressed: "
+    );
+
+    Serial.println(
+      key
+    );
+
+
+    handleCommand(
+      key
+    );
+  }
+
+
+  /* ==========================================================
+     ACTUATOR
+     ========================================================== */
+
+  handleActuator();
+
+
+  /* ==========================================================
+     AS5600 UPDATE
+     ========================================================== */
+
+  updateEncoder();
+
+
+  /* ==========================================================
+     SD LOGGING
+     ========================================================== */
+
+  handleLogging();
+
+
+  /* ==========================================================
+     SD FLUSH
+     ========================================================== */
+
+  static uint32_t lastFlush =
+    0;
+
+
+  if (
+    sdOK &&
+    millis() - lastFlush >= 1000
+  )
+  {
+    logFile.flush();
+
+    lastFlush =
+      millis();
+  }
+}
